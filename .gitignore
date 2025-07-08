@@ -2,3 +2,5 @@
 /gene_expressions_lung_cancer/01_Data_extraction/output_csvs
 /gene_expressions_lung_cancer/02_Prediction_model/x_df_raw_cleaned.csv
 /gene_expressions_lung_cancer/02_Prediction_model/y_df.csv
+/gene_expressions_lung_cancer/01_Data_extraction/GSE81089_readcounts_featurecounts.tsv.gz
+/gene_expressions_lung_cancer/01_Data_extraction/GSE81089_FPKM_cufflinks.tsv.gz
