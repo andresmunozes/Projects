@@ -1,0 +1,176 @@
+-- Use `physionet-data.mimiciv_derived` and `physionet-data.mimiciv_icu`
+
+WITH sepsis_patients AS (
+    -- 1. Get Sepsis-3 patients for their first ICU stay only
+    SELECT s3.stay_id, icu.hadm_id, s3.subject_id FROM `physionet-data.mimiciv_derived.sepsis3` s3
+    INNER JOIN `physionet-data.mimiciv_derived.icustay_detail` icu ON s3.stay_id = icu.stay_id
+    WHERE s3.sepsis3 IS TRUE AND icu.first_icu_stay IS TRUE
+),
+ventilated_patients AS (
+    -- 2. Get first invasive ventilation event for each sepsis patient
+    SELECT s.stay_id, s.hadm_id, s.subject_id, v.starttime AS ventilation_starttime, v.endtime AS weaning_time FROM sepsis_patients s
+    INNER JOIN `physionet-data.mimiciv_derived.ventilation` v ON s.stay_id = v.stay_id
+    WHERE v.ventilation_status = 'InvasiveVent'
+    QUALIFY ROW_NUMBER() OVER(PARTITION BY s.stay_id ORDER BY v.starttime) = 1
+),
+-- 3. CTEs for Outcome Generation (Weaning Failure Conditions)
+-- This block checks for the three failure criteria defined in the paper.
+-- Each CTE creates a list of stay_ids that meet a specific failure condition.
+
+reintubation_check AS (
+    -- a. Find stays that were reintubated within 48h post-weaning
+    SELECT DISTINCT vp.stay_id FROM ventilated_patients vp JOIN `physionet-data.mimiciv_derived.ventilation` v ON vp.stay_id = v.stay_id
+    WHERE v.ventilation_status = 'InvasiveVent' AND v.starttime BETWEEN vp.weaning_time AND DATETIME_ADD(vp.weaning_time, INTERVAL 48 HOUR)
+),
+death_check AS (
+    -- b. Find stays where the patient died within 48h post-weaning
+    SELECT DISTINCT vp.stay_id FROM ventilated_patients vp JOIN `physionet-data.mimiciv_derived.icustay_detail` detail ON vp.stay_id = detail.stay_id
+    WHERE detail.dod BETWEEN vp.weaning_time AND DATETIME_ADD(vp.weaning_time, INTERVAL 48 HOUR)
+),
+niv_duration_check AS (
+    -- c. Find stays with >= 48h of non-invasive ventilation post-weaning
+    SELECT vp.stay_id FROM ventilated_patients vp JOIN `physionet-data.mimiciv_derived.ventilation` v ON vp.stay_id = v.stay_id
+    WHERE v.ventilation_status LIKE 'NonInvasiveVent' AND v.starttime < DATETIME_ADD(vp.weaning_time, INTERVAL 48 HOUR)
+    GROUP BY vp.stay_id HAVING SUM(DATETIME_DIFF(v.endtime, v.starttime, HOUR)) >= 48
+),
+
+-- 4. PRE-AGGREGATION CTEs for Predictor Variables
+-- Each of the following CTEs calculates the "worst" value of a variable
+-- in the 24 hours prior to weaning, resulting in one summary row per patient.
+
+vitals_agg AS (
+    -- a. Get aggregated vital signs
+    SELECT vp.stay_id, MAX(v.heart_rate) AS highest_heart_rate, MAX(v.resp_rate) AS highest_resp_rate, MIN(v.mbp) AS lowest_map, MIN(v.spo2) AS lowest_spo2, MAX(v.temperature) AS highest_temperature
+    FROM ventilated_patients vp JOIN `physionet-data.mimiciv_derived.vitalsign` v ON vp.stay_id = v.stay_id WHERE v.charttime BETWEEN DATETIME_SUB(vp.weaning_time, INTERVAL 24 HOUR) AND vp.weaning_time GROUP BY vp.stay_id
+),
+chem_agg AS (
+    -- b. Get aggregated chemistry labs
+    SELECT vp.hadm_id, MAX(c.creatinine) AS highest_creatinine, MAX(c.aniongap) AS highest_aniongap
+    FROM ventilated_patients vp JOIN `physionet-data.mimiciv_derived.chemistry` c ON vp.hadm_id = c.hadm_id WHERE c.charttime BETWEEN DATETIME_SUB(vp.weaning_time, INTERVAL 24 HOUR) AND vp.weaning_time GROUP BY vp.hadm_id
+),
+cbc_agg AS (
+    -- c. Get aggregated complete blood count labs
+    SELECT vp.hadm_id, MAX(cbc.wbc) AS highest_wbc, MIN(cbc.hemoglobin) AS lowest_hemoglobin, MIN(cbc.platelet) AS lowest_platelets
+    FROM ventilated_patients vp JOIN `physionet-data.mimiciv_derived.complete_blood_count` cbc ON vp.hadm_id = cbc.hadm_id WHERE cbc.charttime BETWEEN DATETIME_SUB(vp.weaning_time, INTERVAL 24 HOUR) AND vp.weaning_time GROUP BY vp.hadm_id
+),
+bg_agg AS (
+    -- d. Get aggregated arterial blood gas values
+    SELECT vp.hadm_id, MIN(bg.ph) AS lowest_ph, MIN(bg.po2) AS lowest_pao2, MAX(bg.pco2) AS highest_paco2, MIN(bg.baseexcess) AS lowest_base_excess, MIN(bg.pao2fio2ratio) AS lowest_pao2fio2ratio
+    FROM ventilated_patients vp JOIN `physionet-data.mimiciv_derived.bg` bg ON vp.hadm_id = bg.hadm_id WHERE bg.specimen = 'ART.' AND bg.charttime BETWEEN DATETIME_SUB(vp.weaning_time, INTERVAL 24 HOUR) AND vp.weaning_time GROUP BY vp.hadm_id
+),
+gcs_agg AS (
+    -- e. Get aggregated GCS scores
+    SELECT vp.stay_id, MIN(gcs.gcs) AS lowest_gcs FROM ventilated_patients vp
+    JOIN `physionet-data.mimiciv_derived.gcs` gcs ON vp.stay_id = gcs.stay_id WHERE gcs.charttime BETWEEN DATETIME_SUB(vp.weaning_time, INTERVAL 24 HOUR) AND vp.weaning_time GROUP BY vp.stay_id
+),
+vent_settings_agg AS (
+    -- f. Get aggregated ventilator settings (PEEP, FiO2, Tidal Volume)
+    SELECT vp.stay_id, MAX(vs.peep) AS highest_peep, MAX(vs.fio2) AS highest_fio2, MIN(vs.tidal_volume_observed) AS lowest_tidal_volume
+    FROM ventilated_patients vp JOIN `physionet-data.mimiciv_derived.ventilator_setting` vs ON vp.stay_id = vs.stay_id
+    WHERE vs.charttime BETWEEN DATETIME_SUB(vp.weaning_time, INTERVAL 24 HOUR) AND vp.weaning_time GROUP BY vp.stay_id
+),
+rsbi_calc AS (
+    -- g. Calculate RSBI as a proxy from the last hour before weaning
+    SELECT vp.stay_id, AVG(vs.respiratory_rate_spontaneous / (vs.tidal_volume_spontaneous / 1000.0)) AS rsbi
+    FROM ventilated_patients vp JOIN `physionet-data.mimiciv_derived.ventilator_setting` vs ON vp.stay_id = vs.stay_id
+    WHERE vs.charttime BETWEEN DATETIME_SUB(vp.weaning_time, INTERVAL 1 HOUR) AND vp.weaning_time
+    AND vs.tidal_volume_spontaneous IS NOT NULL AND vs.tidal_volume_spontaneous > 0 GROUP BY vp.stay_id
+),
+bmi_calc AS (
+    -- h. Calculate Body Mass Index (BMI) from first-day measurements
+    SELECT vp.stay_id, (w.weight / POW(h.height / 100, 2)) AS bmi FROM ventilated_patients vp
+    LEFT JOIN `physionet-data.mimiciv_derived.first_day_height` h ON vp.stay_id = h.stay_id
+    LEFT JOIN `physionet-data.mimiciv_derived.first_day_weight` w ON vp.stay_id = w.stay_id QUALIFY ROW_NUMBER() OVER(PARTITION BY vp.stay_id ORDER BY w.weight) = 1
+),
+urine_output_agg AS (
+    -- i. Get total urine output in the 24h before weaning
+    SELECT vp.stay_id, SUM(uo.urineoutput) AS urine_output_24hr FROM ventilated_patients vp
+    LEFT JOIN `physionet-data.mimiciv_derived.urine_output` uo ON vp.stay_id = uo.stay_id
+    WHERE uo.charttime BETWEEN DATETIME_SUB(vp.weaning_time, INTERVAL 24 HOUR) AND vp.weaning_time GROUP BY vp.stay_id
+),
+vasopressor_agg AS (
+    -- j. Create a flag for vasopressor use in the 24h before weaning
+    SELECT vp.stay_id, MAX(CASE WHEN va.norepinephrine > 0 OR va.epinephrine > 0 OR va.dopamine > 0 OR va.phenylephrine > 0 OR va.vasopressin > 0 THEN 1 ELSE 0 END) as vasopressor_used FROM ventilated_patients vp
+    LEFT JOIN `physionet-data.mimiciv_derived.vasoactive_agent` va ON vp.stay_id = va.stay_id
+    WHERE va.starttime BETWEEN DATETIME_SUB(vp.weaning_time, INTERVAL 24 HOUR) AND vp.weaning_time GROUP BY vp.stay_id
+),
+antibiotic_agg AS (
+    -- k. Calculate total days of antibiotic therapy before weaning
+    SELECT vp.hadm_id, SUM(DATETIME_DIFF(abx.stoptime, abx.starttime, DAY)) AS antibiotic_duration_days FROM ventilated_patients vp
+    JOIN `physionet-data.mimiciv_derived.antibiotic` abx ON vp.hadm_id = abx.hadm_id WHERE abx.starttime < vp.weaning_time GROUP BY vp.hadm_id
+),
+crrt_agg AS (
+    -- l. Calculate total days of CRRT therapy before weaning
+    SELECT vp.stay_id, COUNT(DISTINCT DATE(crrt.charttime)) as crrt_duration_days FROM ventilated_patients vp
+    JOIN `physionet-data.mimiciv_derived.crrt` crrt ON vp.stay_id = crrt.stay_id WHERE crrt.charttime < vp.weaning_time GROUP BY vp.stay_id
+)
+
+-- 5. Final Select: Assemble all features into one table
+-- This final block joins all the pre-aggregated CTEs to create the final dataset.
+SELECT
+    vp.stay_id,
+    vp.subject_id,
+    -- a. Response Variable (the outcome to be predicted)
+    CASE WHEN re.stay_id IS NOT NULL THEN 0 WHEN death.stay_id IS NOT NULL THEN 0 WHEN niv.stay_id IS NOT NULL THEN 0 ELSE 1 END AS weaning_success,
+    
+    -- b. Demographics and baseline characteristics
+    age.age, detail.gender AS sex, bmi.bmi,
+    -- c. Comorbidities and Severity Scores
+    ch.charlson_comorbidity_index, ch.chronic_pulmonary_disease, ch.congestive_heart_failure, ch.dementia, ch.severe_liver_disease, ch.renal_disease, ch.rheumatic_disease,
+    (ch.diabetes_with_cc + ch.diabetes_without_cc) AS diabetes,
+    saps.sapsii, -- Added
+    sofa.sofa AS first_day_sofa, -- Added
+    
+    -- d. Calculated Durations, Flags, and Therapeutic Measures
+    DATETIME_DIFF(vp.weaning_time, vp.ventilation_starttime, DAY) as imv_duration_days,
+    COALESCE(vaso.vasopressor_used, 0) as vasopressor_used,
+    COALESCE(abx.antibiotic_duration_days, 0) as antibiotic_duration_days,
+    COALESCE(crrt.crrt_duration_days, 0) as crrt_duration_days,
+    uo.urine_output_24hr,
+    
+    -- e. Aggregated Lab and Vital Signs (worst values from the 24h window)
+    v.highest_heart_rate, v.highest_resp_rate, v.lowest_map, v.lowest_spo2, v.highest_temperature,
+    ca.highest_creatinine, ca.highest_aniongap,
+    cbca.highest_wbc, cbca.lowest_hemoglobin, cbca.lowest_platelets,
+    bga.lowest_ph, bga.lowest_pao2, bga.highest_paco2, bga.lowest_base_excess, bga.lowest_pao2fio2ratio,
+    gcs.lowest_gcs,
+    
+    -- f. Aggregated Ventilation and Benchmark Parameters
+    vent.highest_peep,
+    vent.highest_fio2,
+    vent.lowest_tidal_volume,
+    rsbi.rsbi 
+
+-- 6. Final Assembly: Join all data sources and apply final filters
+-- This block takes the main patient cohort and joins all the static and 
+-- pre-aggregated CTEs to build the final, wide-format table.
+
+FROM ventilated_patients vp
+-- a. Join with failure condition CTEs
+LEFT JOIN reintubation_check re ON vp.stay_id = re.stay_id
+LEFT JOIN death_check death ON vp.stay_id = death.stay_id
+LEFT JOIN niv_duration_check niv ON vp.stay_id = niv.stay_id
+-- b. Join with static data tables (demographics, comorbidities, scores)
+LEFT JOIN `physionet-data.mimiciv_derived.age` age ON vp.hadm_id = age.hadm_id
+LEFT JOIN `physionet-data.mimiciv_derived.icustay_detail` detail ON vp.stay_id = detail.stay_id
+LEFT JOIN `physionet-data.mimiciv_derived.charlson` ch ON vp.hadm_id = ch.hadm_id
+LEFT JOIN `physionet-data.mimiciv_derived.sapsii` saps ON vp.stay_id = saps.stay_id
+LEFT JOIN `physionet-data.mimiciv_derived.first_day_sofa` sofa ON vp.stay_id = sofa.stay_id
+-- c. Join with pre-aggregated predictor variable CTEs
+LEFT JOIN vitals_agg v ON vp.stay_id = v.stay_id
+LEFT JOIN chem_agg ca ON vp.hadm_id = ca.hadm_id
+LEFT JOIN cbc_agg cbca ON vp.hadm_id = cbca.hadm_id
+LEFT JOIN bg_agg bga ON vp.hadm_id = bga.hadm_id
+LEFT JOIN gcs_agg gcs ON vp.stay_id = gcs.stay_id
+LEFT JOIN vent_settings_agg vent ON vp.stay_id = vent.stay_id
+LEFT JOIN bmi_calc bmi ON vp.stay_id = bmi.stay_id
+LEFT JOIN urine_output_agg uo ON vp.stay_id = uo.stay_id
+LEFT JOIN vasopressor_agg vaso ON vp.stay_id = vaso.stay_id
+LEFT JOIN antibiotic_agg abx ON vp.hadm_id = abx.hadm_id
+LEFT JOIN crrt_agg crrt ON vp.stay_id = crrt.stay_id
+LEFT JOIN rsbi_calc rsbi ON vp.stay_id = rsbi.stay_id
+
+-- Apply final exclusion criteria from the paper
+WHERE age.age >= 18
+-- Sort the final output by patient for readability
+ORDER BY vp.subject_id;

@@ -1,0 +1,26 @@
+-- Query 1a: Get all tables and columns from the mimiciv_icu dataset
+-- This query accesses the database's metadata to list every table and column,
+-- along with its data type and position. This was used to map variables from
+-- the paper to their source locations in the database.
+SELECT
+    'mimiciv_icu' AS dataset_name,
+    table_name,
+    column_name,
+    data_type,
+    ordinal_position
+FROM
+    `physionet-data.mimiciv_icu`.INFORMATION_SCHEMA.COLUMNS
+ORDER BY
+    table_name, ordinal_position;
+
+-- Query 1b: Get all tables and columns from the mimiciv_derived dataset
+SELECT
+    'mimiciv_derived' AS dataset_name,
+    table_name,
+    column_name,
+    data_type,
+    ordinal_position
+FROM
+    `physionet-data.mimiciv_derived`.INFORMATION_SCHEMA.COLUMNS
+ORDER BY
+    table_name, ordinal_position;

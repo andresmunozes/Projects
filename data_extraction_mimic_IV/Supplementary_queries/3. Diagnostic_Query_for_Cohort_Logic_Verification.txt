@@ -1,0 +1,29 @@
+-- Query 3: Diagnostic Query for Cohort Logic Verification
+-- This diagnostic query performs a case study on a single patient (subject_id = 10001884)
+-- to verify the main query's cohort selection logic. It lists all of the patient's
+-- historical hospital admissions and flags which of those included an ICU stay
+-- with a sepsis diagnosis.
+SELECT
+    a.subject_id,
+    a.age,
+    a.hadm_id,
+    -- This column checks if a sepsis diagnosis is present for the given admission
+    CASE
+        WHEN s3.sepsis3 IS TRUE THEN TRUE
+        ELSE FALSE
+    END AS had_sepsis_during_admission
+FROM
+    -- 1. Start with the patient's entire admission history from the age table
+    `physionet-data.mimiciv_derived.age` AS a
+LEFT JOIN
+    -- 2. Join with icustays to find the stay_id for each admission (if it exists)
+    `physionet-data.mimiciv_icu.icustays` AS icu
+    ON a.hadm_id = icu.hadm_id
+LEFT JOIN
+    -- 3. Join with sepsis3 to check if that ICU stay had a sepsis diagnosis
+    `physionet-data.mimiciv_derived.sepsis3` AS s3
+    ON icu.stay_id = s3.stay_id
+WHERE
+    a.subject_id = 10001884
+ORDER BY
+    a.age;

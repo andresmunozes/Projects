@@ -1,0 +1,11 @@
+-- Query 2: Initial Septic Cohort Sizing
+-- This query calculates the total number of unique ICU stays that met the Sepsis-3
+-- criteria in the current MIMIC-IV version. The purpose was to establish the
+-- initial cohort size for a direct comparison with the initial dimension
+-- reported by Liu et al. (2022).
+SELECT
+    COUNT(DISTINCT stay_id) AS initial_septic_cohort_size
+FROM
+    `physionet-data.mimiciv_derived.sepsis3`
+WHERE
+    sepsis3 IS TRUE;
