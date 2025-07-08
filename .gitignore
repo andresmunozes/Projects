@@ -1,0 +1,4 @@
+/gene_expressions_lung_cancer/01. Data extraction/*.gz
+/gene_expressions_lung_cancer/01_Data_extraction/output_csvs
+/gene_expressions_lung_cancer/02_Prediction_model/x_df_raw_cleaned.csv
+/gene_expressions_lung_cancer/02_Prediction_model/y_df.csv
